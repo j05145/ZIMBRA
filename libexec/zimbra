@@ -1,0 +1,114 @@
+#!/bin/bash
+# 
+# ***** BEGIN LICENSE BLOCK *****
+# Zimbra Collaboration Suite Server
+# Copyright (C) 2005, 2006, 2007, 2009, 2010, 2013, 2014, 2016 Synacor, Inc.
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software Foundation,
+# version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+# ***** END LICENSE BLOCK *****
+# 
+#
+# Init file for zimbra mail
+#
+# chkconfig: 345 99 01
+# description: Zimbra mail service
+#
+### BEGIN INIT INFO
+# Provides:       zimbra
+# Required-Start: $network $remote_fs $syslog $time cron
+# Required-Stop:  $network $remote_fs $syslog $time
+# Default-Start:  3 5
+# Default-Stop:   0 1 6
+# Description:    Zimbra mail service
+### END INIT INFO
+
+
+is_zimbra_license_daemon_installed() {
+	if [ -f /opt/zimbra/license/config/license-daemon.cnf ]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+command() {
+    if [ -f /opt/zimbra/redolog/redo.log ]; then
+        chown -f zimbra:zimbra /opt/zimbra/redolog/redo.log
+    fi
+
+    runuser -l zimbra -c "zmcontrol $1 </dev/null"
+    RETVAL1=$?
+
+    case "$1" in
+        status|reload)
+            # Do not run zmlicensectl for status or reload
+            RETVAL2=0
+            ;;
+        shutdown)
+            # Use stop for zmlicensectl when command is shutdown
+            if is_zimbra_license_daemon_installed; then
+                runuser -l zimbra -c "zmlicensectl --service stop </dev/null"
+                RETVAL2=$?
+            else
+                RETVAL2=0
+            fi
+            ;;
+        startup)
+            # Use start for zmlicensectl when command is startup
+            if is_zimbra_license_daemon_installed; then
+                runuser -l zimbra -c "zmlicensectl --service start </dev/null"
+                RETVAL2=$?
+            else
+                RETVAL2=0
+            fi
+            ;;
+        *)
+            # For other commands, do nothing for zmlicensectl
+            RETVAL2=0
+            ;;
+    esac
+
+    if [ $RETVAL1 -ne 0 ] || [ $RETVAL2 -ne 0 ]; then
+        RETVAL=1
+    else
+        RETVAL=0
+    fi
+}
+
+case "$1" in
+    restart)
+        command shutdown
+        command startup
+        if [ -d /var/lock/subsys -a $RETVAL -eq 0 ]; then
+            touch /var/lock/subsys/zimbra
+        fi
+        ;;
+    start)
+        command startup
+        if [ -d /var/lock/subsys -a $RETVAL -eq 0 ]; then
+            touch /var/lock/subsys/zimbra
+        fi
+        ;;
+    stop)
+        command shutdown
+        if [ -d /var/lock/subsys -a $RETVAL -eq 0 ]; then
+            rm -f /var/lock/subsys/zimbra
+        fi
+        ;;
+    reload|status)
+        command $1
+        ;;
+    *)
+        echo $"Usage: $0 {start|stop|restart|reload|status}"
+        RETVAL=1
+        ;;
+esac
+exit $RETVAL
