@@ -1,0 +1,471 @@
+#!/bin/bash
+# ***** BEGIN LICENSE BLOCK *****
+# Zimbra Collaboration Suite Server
+# Copyright (C) 2010, 2011, 2013, 2014, 2015, 2016 Synacor, Inc.
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software Foundation,
+# version 2 of the License.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License along with this program.
+# If not, see <https://www.gnu.org/licenses/>.
+# ***** END LICENSE BLOCK *****
+# 
+
+if [ x`whoami` != xzimbra ]; then
+	echo Error: must be run as zimbra user
+	exit 1
+fi
+
+CONFIG_FILE=/opt/zimbra/license/config/license-daemon.cnf
+ZMJAVA="/opt/zimbra/common/lib/jvm/java/bin/java"
+LD_LIBRARY_PATH="/opt/zimbra/license/lib"
+LICENSE_DAEMON_SERVICE="/opt/zimbra/license/lib/app.jar"
+LICENSE_DAEMON_SERVICE_PORT="8081"
+licenseDaemonServicepid=""
+
+checkLicenseDaemonServiceRunning()
+{
+	licenseDaemonServicepid=`ps -aef | grep ${LICENSE_DAEMON_SERVICE} | grep -v grep |awk '{print $2}'`
+	if [ "x$licenseDaemonServicepid" = "x" ]; then
+		licenseDaemonServiceRunning=0
+	else
+		licenseDaemonServiceRunning=1
+	fi
+} 
+
+startLicenseDaemonService()
+{
+	err=0
+	checkLicenseDaemonServiceRunning
+	echo -n "Starting license daemon service..."
+	if [ $licenseDaemonServiceRunning = 1 ]; then
+		echo "license daemon service is already running."
+		return
+	fi
+	/opt/zimbra/bin/zmprov -l gs `/opt/zimbra/bin/zmhostname` zimbraServiceEnabled 2>/dev/null | grep -qw license-daemon
+	if [ $? = 1 ]; then
+		echo "license daemon service is not enabled!  failed."
+		err=1
+		return
+	fi
+	if [ ! -f ${CONFIG_FILE} ]; then
+		echo "Error: ${CONFIG_FILE} is missing."
+		err=1
+		return
+	fi
+	source $CONFIG_FILE
+	if [ "x$zimbra_license_daemon_log_level" = "x" ]; then
+		zimbra_license_daemon_log_level=ERROR
+	fi
+	if [ "x$zimbra_license_daemon_offline_mode" = "x" ]; then
+		zimbra_license_daemon_offline_mode=false
+	fi
+	if [ -f ${LD_LIBRARY_PATH}/libShafer-prod-linux64.so ]; then
+		export LD_LIBRARY_PATH; nohup ${ZMJAVA} -Dlicense-daemon.log.level=${zimbra_license_daemon_log_level} -Dlicense-daemon.offline.mode=${zimbra_license_daemon_offline_mode} -jar $LICENSE_DAEMON_SERVICE --spring.profiles.active=prod --server.port=$LICENSE_DAEMON_SERVICE_PORT > /dev/null 2>&1 &
+	else
+		export LD_LIBRARY_PATH; nohup ${ZMJAVA} -Dlicense-daemon.log.level=${zimbra_license_daemon_log_level} -Dlicense-daemon.offline.mode=${zimbra_license_daemon_offline_mode} -jar $LICENSE_DAEMON_SERVICE --spring.profiles.active=dev --server.port=$LICENSE_DAEMON_SERVICE_PORT > /dev/null 2>&1 &
+	fi
+	sleep 5
+	checkLicenseDaemonServiceRunning
+	if [ $licenseDaemonServiceRunning -lt 1 ]; then
+		echo "Failed to start"
+		err=1
+		return
+	else
+		echo "done."
+		return
+	fi
+}
+
+exportOfflineLicenseData() {
+    startTimeStr=""
+    endTimeStr=""
+
+    # parse start and end times from arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --exportStartTime)
+                shift
+                startTimeStr="$1"
+                ;;
+            --exportEndTime)
+                shift
+                endTimeStr="$1"
+                ;;
+            *)
+                echo "Error: Unknown argument: $1"
+                exit 1
+                ;;
+        esac
+        shift
+    done
+
+    if [[ -n "$startTimeStr" && -z "$endTimeStr" ]] || [[ -z "$startTimeStr" && -n "$endTimeStr" ]]; then
+        echo "Error: Both --exportStartTime and --exportEndTime are required, or use no arguments to default to 90 days."
+        exit 1
+    elif [[ -n "$startTimeStr" && -n "$endTimeStr" ]]; then
+        # validating date format
+        if ! date -d "$startTimeStr" >/dev/null 2>&1 || ! date -d "$endTimeStr" >/dev/null 2>&1; then
+            echo "Error: Invalid date format. Please use YYYY/MM/DD."
+            exit 1
+        fi
+
+        # converting to Epoch timestamps
+        startEpoch=$(date -d "$startTimeStr" +%s)
+        endEpoch=$(date -d "$endTimeStr" +%s)
+
+        # input validation (dates)
+        todayEpoch=$(date +%s)
+        if (( endEpoch > todayEpoch )); then
+            echo "Error: endTime cannot be after today."
+            exit 1
+        fi
+        if (( startEpoch > endEpoch )); then
+            echo "Error: startTime must be before or equal to endTime."
+            exit 1
+        fi
+    else
+        # defaults to 90 days if no dates provided
+        echo "Defaulting export to 90 days..."
+        endEpoch=$(date +%s)
+        startEpoch=$(( endEpoch - 90 * 86400 ))
+    fi
+
+    # get the license daemon server host from zmprov
+    licenseDaemonHost=$(zmprov gcf zimbraLicenseDaemonServerHost | cut -d ':' -f2 | xargs)
+
+    # check if licenseDaemonHost is empty
+    if [ -z "$licenseDaemonHost" ]; then
+        echo "Error: Could not determine the license daemon host. zimbraLicenseDaemonServerHost is empty."
+        exit 1
+    fi
+
+    # Directly call zmlicense with epoch timestamps
+    echo "Exporting offline license data from $(date -d @$startEpoch +"%Y/%m/%d") to $(date -d @$endEpoch +"%Y/%m/%d")"
+    zmlicense --exportOfflineLicenseData --exportStartTime "$startEpoch" --exportEndTime "$endEpoch"
+    if [[ $? -ne 0 ]]; then
+        echo "Error: zmlicense failed to export data. Check logs for details."
+        exit 1
+    fi
+
+    # Rsync to local system (filename uses the original epoch timestamps)
+    rsyncCmd="/opt/zimbra/common/bin/rsync -az -e 'ssh -T -i /opt/zimbra/.ssh/zimbra_identity -o StrictHostKeyChecking=no' zimbra@$licenseDaemonHost:/etc/nalpeiron/exports/daemondata_${startEpoch}_${endEpoch}.csv /opt/zimbra/data/license/"
+
+    eval "$rsyncCmd"
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to copy license data from remote host."
+        exit 1
+    fi
+
+    echo "Offline license data exported successfully for the period from $(date -d @$startEpoch +"%Y/%m/%d") to $(date -d @$endEpoch +"%Y/%m/%d"), exported to: /opt/zimbra/data/license/daemondata_${startEpoch}_${endEpoch}.csv"
+}
+
+clearLicenseWorkDir() {
+    echo "clearing license cache..."
+    LICENSE_WORK_DIR="/opt/zimbra/license/work/"
+    LICENSE_DATA_DIR="/opt/zimbra/data/license/"
+
+    # getting the license daemon server host from zmprov
+    licenseDaemonHost=$(zmprov gcf zimbraLicenseDaemonServerHost | cut -d ':' -f2 | xargs)
+
+    if [ -z "$licenseDaemonHost" ]; then
+        echo "Error: Could not determine the license daemon host. zimbraLicenseDaemonServerHost is empty."
+        exit 1
+    fi
+
+    # getting log files from cache to backup
+    logFiles=$(/opt/zimbra/common/bin/rsync --list-only -az -e 'ssh -T -i /opt/zimbra/.ssh/zimbra_identity -o StrictHostKeyChecking=no' zimbra@$licenseDaemonHost:$LICENSE_WORK_DIR)
+
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to list log files on remote host."
+        exit 1
+    fi
+
+    # extract the filenames from the rsync output
+    logFiles=$(echo "$logFiles" | awk '{print $NF}' | grep '\.log$')
+
+    if [[ -z "$logFiles" ]]; then
+        echo "No log files found in $LICENSE_WORK_DIR on remote host."
+    else
+        for logFile in $logFiles; do
+            echo "copying $logFile from remote host..."
+            rsyncCmd="/opt/zimbra/common/bin/rsync -az -e 'ssh -T -i /opt/zimbra/.ssh/zimbra_identity -o StrictHostKeyChecking=no' zimbra@$licenseDaemonHost:$LICENSE_WORK_DIR$logFile $LICENSE_DATA_DIR"
+            eval "$rsyncCmd"
+            if [[ $? -ne 0 ]]; then
+                echo "Error: Failed to copy $logFile from remote host."
+                exit 1
+            fi
+        done
+    fi
+
+    echo "deleting license cache contents. . ."
+    # creating temporary directory for rsync
+    empty_dir=$(mktemp -d /tmp/license.XXXXXX) || { echo "Failed to create empty directory"; exit 1; }
+    # execute rsync command
+    /opt/zimbra/common/bin/rsync -az --delete -e 'ssh -i /opt/zimbra/.ssh/zimbra_identity -o StrictHostKeyChecking=no' "$empty_dir/" zimbra@$licenseDaemonHost:$LICENSE_WORK_DIR
+    # rsync exit code
+    rsync_exit_code=$?
+    # deleting temp dir
+    rm -rf "$empty_dir"
+
+    if [[ $rsync_exit_code -ne 0 ]]; then
+	    echo "Error: Failed to clear the license cache on remote host."
+            exit 1
+    fi
+
+    echo "License cache cleared successfully."
+}
+
+checkNalpeironDaemonServiceRunning() {
+	nalpeironDaemonServiceRunning=0
+	sudo systemctl status nalpdaemon &>/dev/null
+	if [ $? -ne 0 ]; then
+		nalpeironDaemonServiceRunning=0
+	else
+		nalpeironDaemonServiceRunning=1
+	fi
+}
+
+startNalpeironDaemonService() {
+	err=0
+	checkNalpeironDaemonServiceRunning
+	echo -n "Starting nalpeiron daemon service..."
+	if [ $nalpeironDaemonServiceRunning = 1 ]; then
+		echo "nalpeiron daemon service is already running."
+		return
+	fi
+	/opt/zimbra/bin/zmprov -l gs `/opt/zimbra/bin/zmhostname` zimbraServiceEnabled 2>/dev/null | grep -qw nalpeiron-daemon
+	if [ $? = 1 ]; then
+		echo "nalpeiron daemon service is not enabled!  failed."
+		err=1
+		return
+	fi
+	if ! sudo systemctl start nalpdaemon &>/dev/null;  then
+		echo "Failed to start"
+		err=1
+		return
+	else
+		sleep 5
+		checkNalpeironDaemonServiceRunning
+		if [ $nalpeironDaemonServiceRunning -lt 1 ]; then
+			echo "Failed to start."
+			err=1
+			return
+		else
+			echo "done."
+			return
+		fi
+	fi
+}
+
+checkNalpeironConnectionStatus() {
+    hostAndPort=$(getLicenseDaemonHostAndPort)
+    apiEndpoint="http://$hostAndPort/v1/rest/connection/check"
+
+    echo "Checking Nalpeiron connection status..."
+    response=$(curl -s "$apiEndpoint")
+    httpStatus=$(curl -s -o /dev/null -w "%{http_code}" "$apiEndpoint")
+    
+    if [ "$httpStatus" -eq 200 ]; then
+        status=$(echo "$response" | sed -n 's/.*"status":\s*\(-\?[0-9]*\).*/\1/p')
+        statusMessage=$(echo "$response" | sed -n 's/.*"statusMessage":"\([^"]*\)".*/\1/p')
+
+        if [ "$status" -eq 0 ]; then
+            echo "Nalpeiron connection is active!"
+        else
+            echo "Error: Nalpeiron connection failed. Status: $status, Message: $statusMessage"
+            exit 1
+        fi
+    else
+        echo "Error: Unable to check nalpeiron connection status from LDS."
+        exit 1
+    fi
+}
+
+getLicenseDaemonHostAndPort() {
+    licenseDaemonHost=$(zmprov gcf zimbraLicenseDaemonServerHost | cut -d ':' -f2 | xargs)
+    licenseDaemonPort=8081
+
+    if [ -z "$licenseDaemonHost" ]; then
+        echo "Error: Could not determine the license daemon host. zimbraLicenseDaemonServerHost is empty."
+        exit 1
+    fi
+
+    echo "$licenseDaemonHost:$licenseDaemonPort"
+}
+
+
+displayHelp()
+{
+	echo "Usage: $0 [option...]"
+	echo
+	echo "   --service start|restart|stop|status"
+	echo "   --service setLogLevel=INFO|DEBUG|ERROR|WARN"
+	echo "   --service setOfflineMode=true|false"
+	echo "   --service getLogLevel"
+	echo "   --service getOfflineMode"
+	echo "   --nalpeiron start|restart|stop|status"
+	echo "   --exportOfflineLicenseData | -exportOfflineLicenseData --exportStartTime YYYY/MM/DD --exportEndTime YYYY/MM/DD (offline only feature)"
+	echo "   --clearLicenseWorkDir"
+	echo "   --checkNalpeironConnectionStatus"
+}
+
+case "$1" in
+	"--service")
+		case "$2" in
+			"start")
+				startLicenseDaemonService
+				exit ${err}
+				;;
+
+			"stop")
+				checkLicenseDaemonServiceRunning
+				echo -n "Stopping license daemon service..."
+				if [ $licenseDaemonServiceRunning -lt 1 ]; then
+					echo "license daemon service is not running."
+					exit 0
+				else
+					kill -9 $licenseDaemonServicepid 2> /dev/null
+					if [ $? != 0 ]; then
+						echo "failed."
+						exit 1
+					else
+						echo "done."
+						exit 0
+					fi
+				fi
+				;;
+
+			"restart")
+				$0 $1 stop
+				$0 $1 start
+				;;
+
+			"status")
+				echo -n "license daemon service is "
+				checkLicenseDaemonServiceRunning
+				if [ $licenseDaemonServiceRunning -lt 1 ]; then
+			  		echo "not running."
+			  		exit 1
+			  	else
+			  		echo "running."
+			  		exit 0
+			  	fi
+			  	;;
+			 
+			"getLogLevel")
+			  # Ensure exact match for "getLogLevel"
+			  if [ "$#" -ne 2 ]; then
+			      displayHelp
+			      exit 1
+			  fi
+			  # Read the current log level from CONFIG_FILE
+			  currentLogLevel=$(grep "zimbra_license_daemon_log_level" "$CONFIG_FILE" | cut -d '=' -f 2)
+			  # Output the current log level
+			  echo "Current log level: $currentLogLevel"
+			  exit 0
+			  ;;
+
+			"getOfflineMode")
+			  # Ensure exact match for "getOfflineMode"
+			  if [ "$#" -ne 2 ]; then
+			      displayHelp
+			      exit 1
+			  fi
+			  # Read the current log level from CONFIG_FILE
+			  offlineMode=$(grep "zimbra_license_daemon_offline_mode" "$CONFIG_FILE" | cut -d '=' -f 2)
+			  # Output the current log level
+			  echo "Current offline mode: $offlineMode"
+			  exit 0
+			  ;;
+
+			"setLogLevel=INFO"|"setLogLevel=DEBUG"|"setLogLevel=ERROR"|"setLogLevel=WARN")
+				loglevel=`echo $2|cut -d = -f 2`
+				sed -i "/zimbra_license_daemon_log_level*/c\zimbra_license_daemon_log_level="$loglevel"" $CONFIG_FILE
+				if [ $? != 0 ]; then
+					exit 1
+				fi
+				exit 0
+				;;
+
+			"setOfflineMode=true"|"setOfflineMode=false")
+				offlineMode=`echo $2|cut -d = -f 2`
+				sed -i "/zimbra_license_daemon_offline_mode*/c\zimbra_license_daemon_offline_mode="$offlineMode"" $CONFIG_FILE
+				if [ $? != 0 ]; then
+					exit 1
+				fi
+				exit 0
+				;;
+
+			*)
+				displayHelp
+				exit 1
+				;;
+		esac
+		;;
+
+	"--nalpeiron")
+		case "$2" in
+			"start")
+				startNalpeironDaemonService
+				exit ${err}
+				;;
+
+			"stop")
+				echo -n "Stopping nalpeiron daemon service..."
+				checkNalpeironDaemonServiceRunning
+				if [ $nalpeironDaemonServiceRunning -lt 1 ]; then
+					echo "not running."
+					exit 0
+				else
+					if ! sudo systemctl stop nalpdaemon &>/dev/null;  then
+						echo "failed."
+						exit 1
+					else
+						echo "done."
+						exit 0
+					fi
+				fi
+				;;
+
+			"restart")
+				$0 $1 stop
+				$0 $1 start
+				;;
+
+			"status")
+				echo -n "nalpeiron daemon service is "
+				checkNalpeironDaemonServiceRunning
+				if [ $nalpeironDaemonServiceRunning -lt 1 ]; then
+					echo "not running."
+					exit 1
+				else
+					echo "running."
+					exit 0
+				fi
+				;;
+			*)
+				displayHelp
+				exit 1
+				;;
+		esac
+		;;
+	"--clearLicenseWorkDir")
+		clearLicenseWorkDir
+		;;
+	"--checkNalpeironConnectionStatus")
+		checkNalpeironConnectionStatus
+		;;
+	"--exportOfflineLicenseData")
+		shift
+		exportOfflineLicenseData "$@"
+		;;
+	*)
+		displayHelp
+		exit 1
+		;;
+esac
